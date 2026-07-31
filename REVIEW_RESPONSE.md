@@ -88,6 +88,29 @@ the `UserError` — and `get_probe_count()` stayed at `1`.
 
 ---
 
+## Also: the SLA breach path itself wasn't actually tested
+
+Not something the review flagged, but found while verifying the fixes above:
+the existing integration test for `SLAVault` only ever probed a stable,
+always-healthy URL, so `uptime_bps` was always `10000` and the test only ever
+exercised "customer claims when SLA was met → correctly refused." The
+breach-and-payout branch of `claim()` had never actually run against live
+consensus.
+
+Added `test_sla_vault_pays_penalty_on_real_breach`: registers a service with
+an `expected_status` the live endpoint will never return (using the fix
+above to force a deterministic `DOWN`), funds a vault, confirms
+`reclaim()` is refused, then confirms `claim()` pays out — verified by
+polling the vault's actual on-chain balance down to `0`, not just its
+`claimed` flag. This surfaced one non-bug worth noting for anyone building
+on the vault: right after `claim()` returns, `get_state()`'s `bond` field can
+briefly lag the real transfer — the payout had already landed on-chain
+(confirmed via `eth_getBalance`) before the vault's own balance view caught
+up. Not a contract defect, but a reason to poll rather than assert on the
+very next read.
+
+---
+
 ## What didn't change
 
 Registration, ownership, lifecycle (deregister/reactivate), ring-buffer
@@ -103,7 +126,7 @@ status check has already passed).
 | | |
 |---|---|
 | Source | [github.com/ometere123/service-uptime-oracle](https://github.com/ometere123/service-uptime-oracle) |
-| Commit | `fix: enforce observed HTTP status and rate-limit probe cadence` |
+| Commits | `06251c1` fix: enforce observed HTTP status and rate-limit probe cadence · `403de35` docs: add response to review · `da1de81` test: exercise the real SLA breach payout path, not just refusal |
 | Redeployed contract (StudioNet) | `0xc44cEAbE1F5699210308A2664E5fD58E15F6032c` |
 | Explorer | [explorer-studio.genlayer.com/address/0xc44cEAbE1F5699210308A2664E5fD58E15F6032c](https://explorer-studio.genlayer.com/address/0xc44cEAbE1F5699210308A2664E5fD58E15F6032c) |
 | Prior address (predates this fix) | `0x6b7d9775B69b5e004da97480D0683EcfC1249722` |
