@@ -409,9 +409,13 @@ gltest.config.yaml                        StudioNet/localnet config
 ## Status
 
 Lint clean. 45 direct tests pass (38 original + 7 covering status-code
-enforcement and probe cadence, added in response to review). 3 integration
-tests pass against real StudioNet consensus, including a full oracle surface
-run and a consumer-vault smoke test.
+enforcement and probe cadence, added in response to review). 4 integration
+tests pass against real StudioNet consensus: a full oracle surface run,
+lifecycle/ownership transfer, and two SLAVault paths — a customer correctly
+refused when the SLA was met, and a customer paid a real on-chain penalty
+after a genuine, live-consensus SLA breach (not just a state assertion; the
+oracle drove uptime_bps to 0 through a real probe, and the vault's bond went
+from 1 GEN to 0 with the funds landing in the customer's wallet).
 
 ## Deployed
 
@@ -486,11 +490,24 @@ deregister -> probe refused -> reactivate -> probe succeeds
 transfer_ownership -> previous owner refused -> new owner deregisters
 ```
 
-And the consumer path:
+And both consumer paths, end to end, against real consensus:
 
 ```text
-deploy SLAVault -> read oracle address, service id, customer and bond state
+SLA met:
+  deploy SLAVault -> fund -> probe (UP) -> period ends
+  -> customer claim() refused: "SLA met — uptime bps >= target bps"
+
+SLA breached:
+  register service with an expected_status the live endpoint will never
+  return -> probe (status mismatch -> DOWN, uptime_bps = 0) -> deploy
+  SLAVault, target 9900 bps -> fund 1 GEN -> period ends
+  -> provider reclaim() refused: "SLA breached — customer may claim penalty"
+  -> customer claim() succeeds -> full bond paid out as penalty
+  -> vault balance 1 GEN -> 0, funds land in the customer's account
 ```
+
+The breach path is the one that actually moves money — verified by reading
+the vault's on-chain balance after the claim, not just its `claimed` flag.
 
 ## The honest limits
 

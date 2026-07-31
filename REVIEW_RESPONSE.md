@@ -108,4 +108,4 @@ status check has already passed).
 | Explorer | [explorer-studio.genlayer.com/address/0xc44cEAbE1F5699210308A2664E5fD58E15F6032c](https://explorer-studio.genlayer.com/address/0xc44cEAbE1F5699210308A2664E5fD58E15F6032c) |
 | Prior address (predates this fix) | `0x6b7d9775B69b5e004da97480D0683EcfC1249722` |
 | Direct tests | 45/45 passing (38 original + 7 new for these fixes) |
-| Integration tests | 3/3 passing against live StudioNet consensus |
+| Integration tests | 4/4 passing against live StudioNet consensus, including a real SLA breach and penalty payout (not just a state assertion — the vault's on-chain balance moved from 1 GEN to 0) |

@@ -7,6 +7,7 @@ Run:
     gltest tests/integration/test_consensus.py -v -s --network studionet
 """
 
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -187,3 +188,75 @@ def test_sla_vault_reads_oracle_state(oracle):
         receipt = vault.connect(customer).claim().transact()
         assert tx_execution_succeeded(receipt)
         assert vault.get_state().call()["claimed"] is True
+
+
+def test_sla_vault_pays_penalty_on_real_breach(oracle):
+    """Exercise the actual breach payout, not just the "SLA met" refusal.
+
+    example.com is stable and always returns HTTP 200, so a real probe can be
+    forced to DOWN deterministically (without depending on a flaky external
+    endpoint) by registering an expected_status the live response will never
+    match. This is the exact status-enforcement path from the review fix:
+    the body reads fine, but the mismatched status still records DOWN, which
+    drives uptime_bps to 0 and puts the vault below any target > 0.
+    """
+    customer = create_accounts(1)[0]
+
+    receipt = oracle.register_service(
+        args=[STABLE_URL, "Breach Test", "", 599]
+    ).transact()
+    assert tx_execution_succeeded(receipt)
+    service_id = oracle.service_count().call()
+
+    _probe(oracle, service_id)
+
+    stats = oracle.get_stats(args=[service_id]).call()
+    assert stats["last_status_name"] == "DOWN"
+    assert oracle.get_uptime_bps(args=[service_id]).call() == 0
+
+    period_end = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    target_bps = 9900
+    vault_factory = get_contract_factory(contract_file_path=VAULT_PATH)
+    receipt = vault_factory.deploy_contract_tx(
+        args=[oracle.address, service_id, customer.address, target_bps, period_end, 1]
+    )
+    assert tx_execution_succeeded(receipt)
+    vault_address = extract_contract_address(receipt)
+    vault = Contract.new(address=vault_address, schema=VAULT_SCHEMA)
+    print(f"\nDeployed SLAVault (breach test) at {vault.address}")
+
+    bond = 1_000_000_000_000_000_000  # 1 GEN
+    receipt = vault.fund().transact(value=bond)
+    assert tx_execution_succeeded(receipt)
+    assert vault.get_state().call()["bond"] == bond
+
+    # Provider cannot reclaim a bond behind a breached SLA.
+    _expect_refused(
+        "provider reclaiming after a real SLA breach",
+        lambda: vault.reclaim().transact(),
+    )
+
+    receipt = vault.connect(customer).claim().transact(
+        wait_triggered_transactions=True
+    )
+    assert tx_execution_succeeded(receipt), "penalty claim must succeed on a real breach"
+
+    state = vault.get_state().call()
+    assert state["claimed"] is True
+    assert state["paid"] is True
+
+    # The penalty transfer is a queued internal message; wait_triggered_transactions
+    # waits for it to be accepted, but the vault's self.balance view can lag that
+    # acceptance by a beat. Poll briefly rather than asserting on the first read.
+    for _ in range(10):
+        state = vault.get_state().call()
+        if state["bond"] == 0:
+            break
+        time.sleep(3)
+
+    # uptime_bps=0 -> shortfall == target_bps -> full bond paid out as penalty.
+    assert state["bond"] == 0, (
+        "vault should be fully drained after a 100% penalty; if this is still "
+        "nonzero the on-chain transfer genuinely didn't happen, not just a "
+        "stale read"
+    )
