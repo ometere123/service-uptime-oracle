@@ -1,6 +1,6 @@
 """StudioNet integration coverage for ServiceUptimeOracle.
 
-These tests exercise live validator consensus, real web.render calls, and the
+These tests exercise live validator consensus, real web.get calls, and the
 public surface that direct mode can only simulate.
 
 Run:

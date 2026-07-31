@@ -81,13 +81,13 @@ def _register(oracle, url=MOCK_URL, name=SERVICE_NAME, contains="", expected_sta
 
 
 def _probe_up(direct_vm, url_re=MOCK_URL_RE):
-    """Healthy probe: status 200 + body → render succeeds → LLM called → UP."""
+    """Healthy probe: status 200 matches expected_status → LLM called → UP."""
     direct_vm.mock_web(url_re, {"status": 200, "body": BODY_UP})
     direct_vm.mock_llm(_LLM_PROMPT, _LLM_UP)
 
 
 def _probe_down(direct_vm, url_re=MOCK_URL_RE):
-    """DOWN probe: status 503 → render raises or returns empty → DOWN (no LLM)."""
+    """DOWN probe: status 503 mismatches expected_status 200 → DOWN (no LLM)."""
     direct_vm.mock_web(url_re, {"status": 503, "body": ""})
 
 
@@ -232,8 +232,9 @@ def test_consecutive_down_accumulates(direct_vm, direct_deploy, direct_alice):
     oracle = _deploy(direct_deploy)
     sid    = _register(oracle)
 
-    for _ in range(4):
-        _probe_down(direct_vm)
+    _probe_down(direct_vm)
+    for i in range(4):
+        warp_to(direct_vm, f"2026-07-01T00:{i * 6:02d}:00Z")
         oracle.probe(sid)
 
     assert oracle.get_consecutive_down(sid) == 4
@@ -254,7 +255,8 @@ def test_consecutive_down_resets_on_up(direct_vm, direct_deploy, direct_alice):
 
     # sid_down probed DOWN 3 times → consecutive_down accumulates independently
     _probe_down(direct_vm, url_re=MOCK_URL_2_RE)
-    for _ in range(3):
+    for i in range(3):
+        warp_to(direct_vm, f"2026-07-01T00:{i * 6:02d}:00Z")
         oracle.probe(sid_down)
     assert oracle.get_consecutive_down(sid_down) == 3
 
@@ -364,7 +366,8 @@ def test_uptime_bps_mixed_via_two_services(direct_vm, direct_deploy, direct_alic
 
     # AllUp: 3 probes → UP
     _probe_up(direct_vm, url_re=MOCK_URL_RE)
-    for _ in range(3):
+    for i in range(3):
+        warp_to(direct_vm, f"2026-07-01T00:{i * 6:02d}:00Z")
         oracle.probe(sid_up)
 
     # AllDown: 1 probe → DOWN
@@ -380,8 +383,9 @@ def test_uptime_bps_all_up(direct_vm, direct_deploy, direct_alice):
     oracle = _deploy(direct_deploy)
     sid    = _register(oracle)
 
-    for _ in range(5):
-        _probe_up(direct_vm)
+    _probe_up(direct_vm)
+    for i in range(5):
+        warp_to(direct_vm, f"2026-07-01T00:{i * 6:02d}:00Z")
         oracle.probe(sid)
 
     assert oracle.get_uptime_bps(sid) == 10000
@@ -489,8 +493,9 @@ def test_get_recent_probes_limit_honoured(direct_vm, direct_deploy, direct_alice
     oracle = _deploy(direct_deploy)
     sid    = _register(oracle)
 
-    for _ in range(5):
-        _probe_up(direct_vm)
+    _probe_up(direct_vm)
+    for i in range(5):
+        warp_to(direct_vm, f"2026-07-01T00:{i * 6:02d}:00Z")
         oracle.probe(sid)
 
     assert len(oracle.get_recent_probes(sid, 3)) == 3
@@ -624,3 +629,118 @@ def test_service_count_reflects_all_registered(direct_vm, direct_deploy, direct_
     _register(oracle, url=MOCK_URL,   name="A")
     _register(oracle, url=MOCK_URL_2, name="B")
     assert oracle.service_count() == 2
+
+
+# ── HTTP status enforcement ────────────────────────────────────────────────────
+
+def test_recorded_probe_has_observed_http_code(direct_vm, direct_deploy, direct_alice):
+    """A matching status code is captured in the ring buffer, not left at 0."""
+    direct_vm.sender = direct_alice
+    oracle = _deploy(direct_deploy)
+    sid    = _register(oracle, expected_status=200)
+
+    _probe_up(direct_vm)
+    oracle.probe(sid)
+
+    probe = oracle.get_recent_probes(sid, 1)[0]
+    assert probe["http_code"] == 200
+    assert probe["status_name"] == "UP"
+
+
+def test_status_mismatch_is_down_without_llm_call(direct_vm, direct_deploy, direct_alice):
+    """A body that reads healthy is still DOWN if the HTTP status doesn't match.
+
+    This is the exact bias the review flagged: content alone can't promote a
+    response to UP when the caller-configured expected_status wasn't met.
+    mock_llm is never registered here — if the contract called exec_prompt
+    with the LLM unmocked (and no live handler configured), the probe would
+    raise instead of completing, so a passing assertion also proves the LLM
+    step was skipped.
+    """
+    direct_vm.sender = direct_alice
+    oracle = _deploy(direct_deploy)
+    sid    = _register(oracle, expected_status=200)
+
+    # Body looks perfectly healthy, but the endpoint returned 500.
+    direct_vm.mock_web(MOCK_URL_RE, {"status": 500, "body": BODY_UP})
+    oracle.probe(sid)
+
+    probe = oracle.get_recent_probes(sid, 1)[0]
+    assert probe["status_name"] == "DOWN"
+    assert probe["http_code"] == 500
+    assert oracle.is_up(sid) is False
+
+
+def test_status_matches_2xx_when_expected_status_is_zero(direct_vm, direct_deploy, direct_alice):
+    """expected_status=0 accepts any 2xx and still records the exact code."""
+    direct_vm.sender = direct_alice
+    oracle = _deploy(direct_deploy)
+    sid    = _register(oracle, expected_status=0)
+
+    direct_vm.mock_web(MOCK_URL_RE, {"status": 201, "body": BODY_UP})
+    direct_vm.mock_llm(_LLM_PROMPT, _LLM_UP)
+    oracle.probe(sid)
+
+    probe = oracle.get_recent_probes(sid, 1)[0]
+    assert probe["http_code"]   == 201
+    assert probe["status_name"] == "UP"
+
+
+def test_status_outside_2xx_is_down_when_expected_status_is_zero(direct_vm, direct_deploy, direct_alice):
+    direct_vm.sender = direct_alice
+    oracle = _deploy(direct_deploy)
+    sid    = _register(oracle, expected_status=0)
+
+    direct_vm.mock_web(MOCK_URL_RE, {"status": 404, "body": BODY_UP})
+    oracle.probe(sid)
+
+    probe = oracle.get_recent_probes(sid, 1)[0]
+    assert probe["status_name"] == "DOWN"
+    assert probe["http_code"]   == 404
+
+
+# ── Probe cadence limit ────────────────────────────────────────────────────────
+
+def test_probe_before_min_interval_reverts(direct_vm, direct_deploy, direct_alice):
+    direct_vm.sender = direct_alice
+    oracle = _deploy(direct_deploy)
+    sid    = _register(oracle)
+
+    _probe_up(direct_vm)
+    oracle.probe(sid)
+
+    with direct_vm.expect_revert("cadence"):
+        oracle.probe(sid)
+
+
+def test_probe_after_min_interval_succeeds(direct_vm, direct_deploy, direct_alice):
+    direct_vm.sender = direct_alice
+    oracle = _deploy(direct_deploy)
+    sid    = _register(oracle)
+
+    warp_to(direct_vm, "2026-07-01T00:00:00Z")
+    _probe_up(direct_vm)
+    oracle.probe(sid)
+
+    warp_to(direct_vm, "2026-07-01T00:05:00Z")  # exactly MIN_PROBE_INTERVAL_SECONDS later
+    oracle.probe(sid)
+
+    assert oracle.get_stats(sid)["total_probes"] == 2
+
+
+def test_cadence_limit_is_per_service(direct_vm, direct_deploy, direct_alice):
+    """The cooldown on one service does not block probing a different service."""
+    direct_vm.sender = direct_alice
+    oracle = _deploy(direct_deploy)
+
+    sid1 = _register(oracle, url=MOCK_URL,   name="Svc1")
+    sid2 = _register(oracle, url=MOCK_URL_2, name="Svc2")
+
+    _probe_up(direct_vm, url_re=MOCK_URL_RE)
+    oracle.probe(sid1)
+
+    _probe_up(direct_vm, url_re=MOCK_URL_2_RE)
+    oracle.probe(sid2)  # different service, no cooldown collision
+
+    assert oracle.get_stats(sid1)["total_probes"] == 1
+    assert oracle.get_stats(sid2)["total_probes"] == 1

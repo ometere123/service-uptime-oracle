@@ -104,8 +104,8 @@ ownership transfer and all views are deterministic.
 
 | Call | Where | Why it cannot be deterministic |
 |---|---|---|
-| `gl.nondet.web.render(url, mode="text")` | `probe` | Network I/O against a live service. A contract cannot deterministically learn whether an endpoint responded. |
-| `gl.nondet.exec_prompt(prompt)` | `probe` | Health is partly semantic. A parser can match bytes; it cannot reliably decide that a page saying "database unavailable" is unhealthy despite HTTP 200. |
+| `gl.nondet.web.get(url)` | `probe` | Network I/O against a live service. A contract cannot deterministically learn the endpoint's status code or body. Always runs. |
+| `gl.nondet.exec_prompt(prompt)` | `probe` | Health is partly semantic. A parser can match bytes; it cannot reliably decide that a page saying "database unavailable" is unhealthy despite HTTP 200. Only runs once the observed status code already matches `expected_status` — a status mismatch is `DOWN` before the model is ever invoked. |
 
 The fetched body is evidence, never instruction. The prompt explicitly tells the
 model to ignore response text that tries to command the assessor.
@@ -117,6 +117,8 @@ contract code:
 
 - input validation for URL, name, expected status and content checks;
 - service ownership and lifecycle permissions;
+- probe cadence enforcement (minimum interval between probes per service);
+- HTTP status code verification against `expected_status`;
 - status clamping and fail-closed parsing;
 - `UP` / `DEGRADED` / `DOWN` counter updates;
 - `consecutive_down` reset and increment rules;
@@ -156,7 +158,8 @@ register_service
 
 probe
   require service exists and is active                 <- deterministic
-  render endpoint and classify health                  <- consensus
+  require min probe interval has elapsed               <- deterministic
+  fetch endpoint, verify status, classify health        <- consensus
   clamp status and truncate note                       <- deterministic
   update ring buffer and aggregate counters            <- deterministic
 
@@ -172,14 +175,21 @@ closed and is counted as not-up.
 
 - A provider cannot suppress bad readings. `probe()` is permissionless.
 - A customer cannot fake an outage. The contract fetches the endpoint itself.
+- A response body cannot talk its way to `UP`. The observed HTTP status code
+  is checked against `expected_status` deterministically, before the model
+  runs; a mismatch is `DOWN` regardless of what the body says.
+- A caller cannot bias the record by sampling only during favorable windows.
+  Probes are rate-limited to one per `MIN_PROBE_INTERVAL_SECONDS` (5 minutes)
+  per service, enforced on-chain regardless of who calls `probe()`.
 - A deactivated service cannot be probed until the owner reactivates it.
 - Ownership transfer does not reset stats or history.
 - A missing service returns `False` for `is_up()` and errors for detailed views.
-- Empty or failed renders become `DOWN`.
+- Empty or failed fetches, and status-code mismatches, become `DOWN`.
 - Unparseable model output becomes `UNKNOWN`.
 - Statuses outside the known enum are clamped to `UNKNOWN`.
 - Probe history is bounded to 100 records per service.
-- Recent probes are returned newest first.
+- Recent probes are returned newest first, including the observed HTTP status
+  code for each probe.
 - Windowed uptime never scans unbounded history.
 
 ## How it works
@@ -341,12 +351,14 @@ genlayer deploy --contract contracts/service_uptime_oracle.py --rpc https://stud
 
 ## Test coverage
 
-38 direct tests cover the state machine and adversarial cases.
+45 direct tests cover the state machine and adversarial cases.
 
 | Area | Cases |
 |---|---|
 | Registration | incremental ids, stored fields, URL scheme, empty values, status bounds, service cap behavior. |
 | Probe outcomes | `UP`, `DEGRADED`, `DOWN`, `UNKNOWN`, fetch failure, empty body, LLM fallback. |
+| HTTP status enforcement | observed code stored and returned, status mismatch forces `DOWN` without an LLM call, `expected_status=0` accepts any 2xx. |
+| Probe cadence | probe before the minimum interval reverts, probe after it succeeds, cooldown is per-service. |
 | Model misbehavior | fenced JSON, malformed output, unknown status, prompt-injection content. |
 | Uptime arithmetic | all-up, all-down, mixed histories, no-probe default. |
 | Windowed uptime | old probes excluded, boundary behavior, no probes in window. |
@@ -396,23 +408,53 @@ gltest.config.yaml                        StudioNet/localnet config
 
 ## Status
 
-Lint clean. 38 direct tests pass. 3 integration tests pass against real
-StudioNet consensus, including a full oracle surface run and a consumer-vault
-smoke test.
+Lint clean. 45 direct tests pass (38 original + 7 covering status-code
+enforcement and probe cadence, added in response to review). 3 integration
+tests pass against real StudioNet consensus, including a full oracle surface
+run and a consumer-vault smoke test.
 
 ## Deployed
 
 | Field | Value |
 |---|---|
 | Network | StudioNet |
-| Address | `0x6b7d9775B69b5e004da97480D0683EcfC1249722` |
-| Studio | `https://studio.genlayer.com/?import-contract=0x6b7d9775B69b5e004da97480D0683EcfC1249722` |
-| Explorer | `https://explorer-studio.genlayer.com/address/0x6b7d9775B69b5e004da97480D0683EcfC1249722` |
+| Address | `0xc44cEAbE1F5699210308A2664E5fD58E15F6032c` |
+| Studio | `https://studio.genlayer.com/?import-contract=0xc44cEAbE1F5699210308A2664E5fD58E15F6032c` |
+| Explorer | `https://explorer-studio.genlayer.com/address/0xc44cEAbE1F5699210308A2664E5fD58E15F6032c` |
+
+This is a redeploy addressing review feedback (see "Response to review" below).
+The prior address, `0x6b7d9775B69b5e004da97480D0683EcfC1249722`, still exists
+on-chain but predates the status-code and cadence fixes.
 
 The integration suite also deploys `SLAVault` as a consumer smoke test and
 verifies that it can read oracle state. The vault is an example contract, not
 the submitted primitive, so the public deployment listed above is the oracle
 only.
+
+## Response to review
+
+The prior submission had two gaps, both fixed in this deployment:
+
+**1. HTTP status was never verified.** The probe fetched content with
+`web.render()`, which does not expose a status code, so `ProbeRecord.http_code`
+was always written as `0` and `expected_status` was never actually checked
+against anything real. Fixed by switching the fetch to `gl.nondet.web.get(url)`,
+which returns the true status code and body. The observed code is now checked
+against `expected_status` **deterministically, before the model runs** — a
+mismatch is `DOWN` unconditionally, so a healthy-reading body can never
+override a bad status. The real code is stored in `http_code` and returned by
+`get_recent_probes`. Verified live: probing service 1 above against
+`https://httpbin.org/status/200` recorded `http_code: 200` (previously this
+field could not be anything but `0`).
+
+**2. Unlimited permissionless probing let callers bias uptime.** `probe()` had
+no rate limit, so a caller with a stake in the outcome could sample only
+during healthy windows, or hammer the ring buffer during an outage, and skew
+`probes_up / total_probes` toward whichever answer benefited them. Fixed with
+`MIN_PROBE_INTERVAL_SECONDS = 300`, enforced on-chain per service regardless
+of caller. Verified live: a second `probe(1)` call issued immediately after
+the first was rejected by consensus (all 5 validators agreed on the
+`UserError`), and `get_probe_count(1)` stayed at `1`.
 
 ## Measured on live consensus
 
@@ -452,8 +494,13 @@ deploy SLAVault -> read oracle address, service id, customer and bond state
 
 ## The honest limits
 
-- Not for high-frequency monitoring. Each probe is a consensus transaction.
-- Not a scheduler. External callers decide when to probe.
+- Not for high-frequency monitoring. Each probe is a consensus transaction,
+  and `MIN_PROBE_INTERVAL_SECONDS` (5 minutes) caps how often a given
+  service can be probed regardless of caller.
+- Not a scheduler. External callers still decide *when*, within the cadence
+  floor, to probe — the floor bounds bias, it does not guarantee uniform
+  sampling. A consumer that needs guaranteed regular readings should run its
+  own keeper against `probe()`.
 - Not a regional availability oracle yet. Each probe asks validators to observe
   the URL; it does not expose region-specific status.
 - Ring-buffer history is capped at 100 records per service.
@@ -465,7 +512,6 @@ deploy SLAVault -> read oracle address, service id, customer and bond state
 
 ## Roadmap
 
-- Minimum probe cadence and freshness checks for consumers.
 - Multi-endpoint service groups for regional redundancy.
 - Optional alert subscriber contracts.
 - Richer maintenance/degradation categories.
